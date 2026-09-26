@@ -1431,3 +1431,129 @@ fn custody_chain_is_capped_at_max_length() {
     let newest = chain.get(MAX_CUSTODY_CHAIN_LENGTH - 1).unwrap();
     assert_eq!(newest.to, new_owner);
 }
+
+// ======================================================
+// Issue #62 — Disputed PendingTransfer blocks expiry/reclaim
+// ======================================================
+
+#[test]
+fn disputed_pending_transfer_blocks_cancel_expired_transfer() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    client.initiate_transfer_with_timeout(&pet_id, &new_owner, &7u32);
+
+    // Raise a dispute on the pending transfer.
+    client.raise_pending_transfer_dispute(&pet_id, &owner);
+
+    // Advance time past the timeout window.
+    env.ledger().with_mut(|l| {
+        l.timestamp += 7 * 24 * 60 * 60 + 1;
+    });
+
+    // Despite the timeout having elapsed, cancel_expired_transfer must revert.
+    let result = client.try_cancel_expired_transfer(&pet_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::TransferDisputed as u32,
+        ))),
+        "cancel_expired_transfer must be blocked while dispute is active"
+    );
+
+    // The transfer must still exist.
+    assert!(client.has_pending_transfer(&pet_id));
+}
+
+#[test]
+fn disputed_pending_transfer_blocks_reclaim_transfer() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    // initiate_transfer uses DEFAULT_TRANSFER_TIMEOUT_SECONDS; reclaim uses TRANSFER_EXPIRY_SECONDS.
+    client.initiate_transfer(&pet_id, &new_owner);
+
+    // Raise a dispute on the pending transfer.
+    client.raise_pending_transfer_dispute(&pet_id, &owner);
+
+    // Advance time past TRANSFER_EXPIRY_SECONDS.
+    env.ledger().with_mut(|l| {
+        l.timestamp += 7 * 24 * 60 * 60 + 1;
+    });
+
+    // reclaim_transfer must also be blocked while a dispute is active.
+    let result = client.try_reclaim_transfer(&pet_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::TransferDisputed as u32,
+        ))),
+        "reclaim_transfer must be blocked while dispute is active"
+    );
+
+    assert!(client.has_pending_transfer(&pet_id));
+}
+
+#[test]
+fn raise_pending_transfer_dispute_requires_party() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    client.initiate_transfer_with_timeout(&pet_id, &new_owner, &7u32);
+
+    let stranger = Address::generate(&env);
+    let result = client.try_raise_pending_transfer_dispute(&pet_id, &stranger);
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::Unauthorized as u32,
+        ))),
+        "non-party must not be able to raise a dispute"
+    );
+}
+
+#[test]
+fn raise_pending_transfer_dispute_idempotent_guard() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    client.initiate_transfer_with_timeout(&pet_id, &new_owner, &7u32);
+
+    // First raise succeeds.
+    client.raise_pending_transfer_dispute(&pet_id, &owner);
+
+    // Second raise must revert with TransferAlreadyDisputed.
+    let result = client.try_raise_pending_transfer_dispute(&pet_id, &owner);
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::TransferAlreadyDisputed as u32,
+        )))
+    );
+}
+
+#[test]
+fn non_disputed_pending_transfer_can_still_be_expired() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    client.initiate_transfer_with_timeout(&pet_id, &new_owner, &7u32);
+
+    // No dispute raised — timeout expiry must still work normally.
+    env.ledger().with_mut(|l| {
+        l.timestamp += 7 * 24 * 60 * 60 + 1;
+    });
+
+    client.cancel_expired_transfer(&pet_id);
+    assert!(!client.has_pending_transfer(&pet_id));
+}

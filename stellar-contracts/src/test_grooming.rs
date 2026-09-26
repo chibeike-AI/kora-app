@@ -576,6 +576,7 @@ mod test_recurring_grooming {
         client.create_grooming_schedule(
             &pet_id,
             &GroomingFrequency::Weekly,
+            &7u32,
             &start,
             &end,
             &String::from_str(&env, "Groomer A"),
@@ -602,6 +603,7 @@ mod test_recurring_grooming {
         let schedule_id = client.create_grooming_schedule(
             &pet_id,
             &GroomingFrequency::Weekly,
+            &7u32,
             &start,
             &end,
             &String::from_str(&env, "Groomer A"),
@@ -633,6 +635,7 @@ mod test_recurring_grooming {
         let schedule_id = client.create_grooming_schedule(
             &pet_id,
             &GroomingFrequency::Weekly,
+            &7u32,
             &start,
             &end,
             &String::from_str(&env, "Groomer A"),

@@ -69,6 +69,10 @@ pub struct PendingTransfer {
     pub to: Address,
     pub initiated_at: u64,
     pub timeout_secs: u64,
+    /// Set to `true` when a dispute is raised against this transfer.
+    /// While `disputed` is `true`, expiry and reclaim operations are blocked
+    /// to prevent bypass of the arbitration process.
+    pub disputed: bool,
 }
 
 /// Default per-transfer cancellation timeout when none is specified to
@@ -269,6 +273,9 @@ pub enum ContractError {
     AdopterApprovalRequired = 32,
     InputStringTooLong = 33,
     AdoptionNotExpired = 34,
+    /// Returned when an attempt is made to expire or reclaim a transfer that
+    /// is currently under active dispute arbitration.
+    TransferDisputed = 35,
 }
 
 /// ======================================================
@@ -774,6 +781,7 @@ impl PetOwnershipContract {
             to: to.clone(),
             initiated_at: env.ledger().timestamp(),
             timeout_secs,
+            disputed: false,
         };
 
         env.storage()
@@ -795,12 +803,19 @@ impl PetOwnershipContract {
     /// # Errors
     /// - [`ContractError::NoPendingTransfer`] — no transfer exists for this pet.
     /// - [`ContractError::TransferNotExpired`] — the timeout window has not elapsed.
+    /// - [`ContractError::TransferDisputed`] — the transfer is under active dispute
+    ///   arbitration; expiry is frozen until the dispute is resolved.
     pub fn cancel_expired_transfer(env: Env, pet_id: u64) {
         let transfer: PendingTransfer = env
             .storage()
             .persistent()
             .get(&DataKey::PendingTransfer(pet_id))
             .unwrap_or_else(|| panic_with_error!(env, ContractError::NoPendingTransfer));
+
+        // Block expiry while an active dispute is in progress.
+        if transfer.disputed {
+            panic_with_error!(env, ContractError::TransferDisputed);
+        }
 
         let now = env.ledger().timestamp();
         if now.saturating_sub(transfer.initiated_at) < transfer.timeout_secs {
@@ -1231,6 +1246,50 @@ impl PetOwnershipContract {
     }
 
     /// ----------------------------------
+    /// RAISE DISPUTE ON PENDING TRANSFER
+    /// ----------------------------------
+    ///
+    /// Marks a `PendingTransfer` as disputed, freezing its expiry and reclaim
+    /// timers until the dispute is resolved. Either party to the transfer may
+    /// call this function.
+    ///
+    /// Once disputed, [`cancel_expired_transfer`] and [`reclaim_transfer`] will
+    /// both revert with [`ContractError::TransferDisputed`] until the transfer's
+    /// `disputed` flag is cleared (e.g. by an admin resolving the dispute).
+    ///
+    /// # Errors
+    /// - [`ContractError::NoPendingTransfer`] – no pending transfer exists for this pet.
+    /// - [`ContractError::Unauthorized`] – caller is not a party to the transfer.
+    /// - [`ContractError::TransferAlreadyDisputed`] – dispute already raised.
+    pub fn raise_pending_transfer_dispute(env: Env, pet_id: u64, caller: Address) {
+        caller.require_auth();
+
+        let mut transfer: PendingTransfer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingTransfer(pet_id))
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::NoPendingTransfer));
+
+        if transfer.disputed {
+            panic_with_error!(env, ContractError::TransferAlreadyDisputed);
+        }
+
+        if caller != transfer.from && caller != transfer.to {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
+
+        transfer.disputed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingTransfer(pet_id), &transfer);
+
+        env.events().publish(
+            (EVT_TRANSFER_DISPUTED, pet_id),
+            (transfer.from, transfer.to),
+        );
+    }
+
+    /// ----------------------------------
     /// CANCEL TRANSFER
     /// ----------------------------------
 
@@ -1276,6 +1335,8 @@ impl PetOwnershipContract {
     /// - [`ContractError::Unauthorized`] – caller is not the original sender.
     /// - [`ContractError::TransferNotExpired`] – the expiry window has not elapsed;
     ///   use [`cancel_transfer`] instead if you want to cancel before expiry.
+    /// - [`ContractError::TransferDisputed`] – the transfer is under active dispute
+    ///   arbitration; reclaiming is frozen until the dispute is resolved.
     pub fn reclaim_transfer(env: Env, pet_id: u64) {
         let transfer: PendingTransfer = env
             .storage()
@@ -1284,6 +1345,11 @@ impl PetOwnershipContract {
             .unwrap_or_else(|| panic_with_error!(env, ContractError::NoPendingTransfer));
 
         transfer.from.require_auth();
+
+        // Block reclaim while an active dispute is in progress.
+        if transfer.disputed {
+            panic_with_error!(env, ContractError::TransferDisputed);
+        }
 
         let now = env.ledger().timestamp();
         if now.saturating_sub(transfer.initiated_at) < TRANSFER_EXPIRY_SECONDS {
@@ -1397,6 +1463,7 @@ impl PetOwnershipContract {
                 to: to.clone(),
                 initiated_at: now,
                 timeout_secs: DEFAULT_TRANSFER_TIMEOUT_SECONDS,
+                disputed: false,
             };
 
             env.storage()

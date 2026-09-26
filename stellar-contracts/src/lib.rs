@@ -196,6 +196,8 @@ mod test_upgrade_proposal;
 // mod test_book_slot;
 #[cfg(test)]
 mod test_emergency_notify_rate_limit;
+#[cfg(test)]
+mod test_wave9;
 
 const DEFAULT_NONCE_MAX_USES: u32 = 1;
 #[allow(dead_code)]
@@ -433,6 +435,9 @@ pub struct RecurringGroomingSchedule {
     pub id: u64,
     pub pet_id: u64,
     pub frequency: GroomingFrequency,
+    /// Number of days between grooming appointments.
+    /// Must be between 1 and 365 (inclusive). Validated at creation time.
+    pub interval_days: u32,
     pub start_date: u64,
     pub end_date: u64,
     pub groomer: String,
@@ -2453,6 +2458,19 @@ pub enum DisputeKey {
     DisputeVoteByVoter(u64, Address),
     /// Ordered list of addresses that have voted on a dispute (for enumeration).
     DisputeVoters(u64),
+    /// Persists verification state for a specific piece of evidence.
+    /// Value: EvidenceVerification struct containing verifier and timestamp.
+    EvidenceVerified((u64, u64)),
+}
+
+/// On-chain record that an authorised verifier has validated a piece of evidence.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceVerification {
+    /// Address of the authorised arbitrator/notary who performed verification.
+    pub verifier: Address,
+    /// Ledger timestamp at the moment of verification.
+    pub verified_at: u64,
 }
 
 #[contract]
@@ -9825,13 +9843,77 @@ impl KoraContract {
         evidence_id
     }
 
-    pub fn verify_evidence(env: Env, dispute_id: u64, evidence_id: u64, hash: BytesN<32>) -> bool {
-        let key = DisputeKey::DisputeEvidence(dispute_id, evidence_id);
-        if let Some(evidence) = env.storage().instance().get::<DisputeKey, Evidence>(&key) {
-            evidence.sha256_hash == hash
-        } else {
-            false
+    /// Verify a piece of submitted evidence.
+    ///
+    /// # Authorization
+    /// `verifier` must be the currently assigned arbitrator (set via
+    /// [`assign_arbitrator`]). The call panics with
+    /// [`ContractError::Unauthorized`] if `verifier` is not the assigned
+    /// arbitrator.
+    ///
+    /// # Errors
+    /// - [`ContractError::RecordNotFound`] — no evidence exists for the given
+    ///   `(dispute_id, evidence_id)` pair.
+    /// - [`ContractError::Unauthorized`] — `verifier` is not the assigned arbitrator.
+    ///
+    /// # Side Effects
+    /// On successful hash match, an [`EvidenceVerification`] record is persisted
+    /// under [`DisputeKey::EvidenceVerified`] so the verification state is
+    /// observable on-chain.
+    pub fn verify_evidence(
+        env: Env,
+        dispute_id: u64,
+        evidence_id: u64,
+        verifier: Address,
+        hash: BytesN<32>,
+    ) -> bool {
+        // Require the verifier to sign the transaction.
+        verifier.require_auth();
+
+        // Ensure the verifier is the assigned arbitrator.
+        let arbitrator: Address = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::Arbitrator)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        if verifier != arbitrator {
+            panic_with_error!(&env, ContractError::Unauthorized);
         }
+
+        // Retrieve the evidence record; panic with NotFound if it doesn't exist.
+        let key = DisputeKey::DisputeEvidence(dispute_id, evidence_id);
+        let evidence: Evidence = env
+            .storage()
+            .instance()
+            .get::<DisputeKey, Evidence>(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::RecordNotFound));
+
+        let matched = evidence.sha256_hash == hash;
+
+        // Persist verification state on-chain regardless of hash match so
+        // adjudication logic can observe who reviewed the evidence and when.
+        let verification = EvidenceVerification {
+            verifier: verifier.clone(),
+            verified_at: env.ledger().timestamp(),
+        };
+        env.storage().instance().set(
+            &DisputeKey::EvidenceVerified((dispute_id, evidence_id)),
+            &verification,
+        );
+
+        matched
+    }
+
+    /// Returns the on-chain verification record for a piece of evidence, if
+    /// it has been verified by an authorised arbitrator.
+    pub fn get_evidence_verification(
+        env: Env,
+        dispute_id: u64,
+        evidence_id: u64,
+    ) -> Option<EvidenceVerification> {
+        env.storage()
+            .instance()
+            .get(&DisputeKey::EvidenceVerified((dispute_id, evidence_id)))
     }
 
     pub fn propose_signer_rotation(
@@ -9860,10 +9942,16 @@ impl KoraContract {
 
     /// Create a recurring grooming schedule and generate the first 4 appointment slots.
     /// Returns the schedule_id.
+    ///
+    /// # Parameters
+    /// - `interval_days`: Number of days between appointments. Must be between
+    ///   1 and 365 (inclusive). Passing 0 or a value greater than 365 panics
+    ///   with [`ContractError::InvalidInput`].
     pub fn create_grooming_schedule(
         env: Env,
         pet_id: u64,
         frequency: GroomingFrequency,
+        interval_days: u32,
         start_date: u64,
         end_date: u64,
         groomer: String,
@@ -9877,6 +9965,11 @@ impl KoraContract {
             .unwrap_or_else(|| panic_with_error!(env, ContractError::PetNotFound));
         pet.owner.require_auth();
 
+        // Validate interval_days: must be strictly positive and at most 365.
+        if interval_days == 0 || interval_days > 365 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
         if end_date <= start_date {
             panic_with_error!(&env, ContractError::InvalidInput);
         }
@@ -9888,7 +9981,8 @@ impl KoraContract {
             .unwrap_or(0);
         let schedule_id = safe_increment(count);
 
-        let interval = Self::frequency_to_seconds(&frequency);
+        // Compute the interval in seconds from the validated interval_days.
+        let interval: u64 = (interval_days as u64).saturating_mul(86_400);
         let mut last_slot_date = start_date;
 
         for i in 0u64..4 {
@@ -9940,6 +10034,7 @@ impl KoraContract {
             id: schedule_id,
             pet_id,
             frequency,
+            interval_days,
             start_date,
             end_date,
             groomer,
@@ -9986,7 +10081,7 @@ impl KoraContract {
             return 0;
         }
 
-        let interval = Self::frequency_to_seconds(&schedule.frequency);
+        let interval: u64 = (schedule.interval_days as u64).saturating_mul(86_400);
         let next_date = schedule.last_slot_date.saturating_add(interval);
 
         if next_date > schedule.end_date {

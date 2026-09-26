@@ -1,4 +1,12 @@
 target/
 Cargo.lock
 test_snapshots/
+*.snap
+**/*.snap
+proptest-regressions/
 *.json
+coverage/
+*.profraw
+*.profdata
+lcov.info
+cobertura.xml
