@@ -2,23 +2,20 @@
 target/
 stellar-contracts/target/
 
-# Dependency lockfiles (generated, not committed at root level)
-# Cargo lock files (workspace-level kept, sub-crate excluded)
+# Cargo lock files (workspace-level Cargo.lock is kept; sub-crate excluded)
 stellar-contracts/Cargo.lock
-test_snapshots/
-ISSUES.md
-node_modules
-.env
-somzilla.md
-*.snap
-*.json.snap
 
 # Test snapshots (proptest / insta)
 test_snapshots/
+**/test_snapshots/
 **/*.snap
 **/*.snap.new
 *.snap
 *.snap.new
+
+# Proptest regression state
+proptest-regressions/
+**/.proptest-regressions/
 
 # Celo / Node
 node_modules/
@@ -30,31 +27,8 @@ celo-contracts/typechain-types/
 .env
 .env.*
 
-# Foundry cache
+# Foundry / Starknet cache
 .snfoundry_cache/
-
-# Editor / OS artifacts
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-.idea/
-.vscode/
-
-# Misc project-specific
-ISSUES.md
-somzilla.md
-**/test_snapshots/
-**/*.snap
-**/*.snap.new
-
-# Proptest regression state directories
-proptest-regressions/
-**/.proptest-regressions/
-
-# Environment / secrets
-.env
-.env.*
 
 # Editor and IDE files
 .vscode/
@@ -67,15 +41,9 @@ proptest-regressions/
 .DS_Store
 Thumbs.db
 
-# Node.js
-node_modules/
-
-# Foundry / Starknet cache
-.snfoundry_cache/
-
-# Misc generated docs / drafts
-ISSUES.md
-somzilla.md
-
 # JSON build artifacts (keep source JSON like package.json)
 *.min.json
+
+# Misc project-specific drafts
+ISSUES.md
+somzilla.md
