@@ -373,6 +373,14 @@ const MAX_GROOMING_SLOT_MINS: u64 = 480;
 /// calculators and weight-history graphs downstream. (Issue #71)
 const MAX_PET_WEIGHT_GRAMS: u32 = 500_000;
 
+/// Maximum length of a behavior record description, in bytes. Bounds
+/// instance storage growth per record. (Issue #302)
+const MAX_BEHAVIOR_DESCRIPTION_LEN: u32 = 500;
+
+/// Maximum number of weight entries returned per `get_weight_history_paged`
+/// call. (Issue #301)
+const MAX_WEIGHT_HISTORY_PAGE_SIZE: u32 = 50;
+
 /// Maximum allowed drift, in seconds, between a caller-supplied feeding
 /// timestamp and the current ledger time. A small allowance (5 minutes)
 /// accommodates minor clock skew between a client and the ledger, while
@@ -912,6 +920,17 @@ pub struct WeightEntry {
 pub struct WeightRecordedEvent {
     pub pet_id: u64,
     pub weight: u32,
+    pub recorded_by: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BehaviorRecordedEvent {
+    pub record_id: u64,
+    pub pet_id: u64,
+    pub behavior_type: BehaviorType,
+    pub severity: u32,
     pub recorded_by: Address,
     pub timestamp: u64,
 }
@@ -5460,7 +5479,8 @@ impl KoraContract {
 
     // --- BEHAVIOR RECORDS (Issue #798) ---
 
-    /// Add a behavior record for a pet. Severity must be between 0 and 10.
+    /// Add a behavior record for a pet. Severity must be between 1 and 5 and
+    /// the description at most `MAX_BEHAVIOR_DESCRIPTION_LEN` bytes.
     pub fn add_behavior_record(
         env: Env,
         pet_id: u64,
@@ -5473,6 +5493,11 @@ impl KoraContract {
 
         // Issue #70: severity is a 1-5 scale, not an arbitrary integer.
         if !(1..=5).contains(&severity) {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        // Issue #302: cap description length to prevent storage bloat.
+        if description.len() > MAX_BEHAVIOR_DESCRIPTION_LEN {
             panic_with_error!(&env, ContractError::InvalidInput);
         }
 
@@ -5492,14 +5517,15 @@ impl KoraContract {
             .unwrap_or(0u64)
             .saturating_add(1);
 
+        let now = env.ledger().timestamp();
         let record = BehaviorRecord {
             id: record_id,
             pet_id,
-            behavior_type,
+            behavior_type: behavior_type.clone(),
             severity,
             description,
-            recorded_by: caller,
-            recorded_at: env.ledger().timestamp(),
+            recorded_by: caller.clone(),
+            recorded_at: now,
         };
 
         env.storage()
@@ -5515,6 +5541,18 @@ impl KoraContract {
         env.storage()
             .instance()
             .set(&BehaviorKey::BehaviorRecordCount, &record_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "BehaviorRecorded"), pet_id),
+            BehaviorRecordedEvent {
+                record_id,
+                pet_id,
+                behavior_type,
+                severity,
+                recorded_by: caller,
+                timestamp: now,
+            },
+        );
 
         record_id
     }
@@ -9463,6 +9501,57 @@ impl KoraContract {
         let end = (offset + effective_limit).min(total);
         for i in offset..end {
             page.push_back(full_history.get(i as u32).unwrap());
+        }
+        page
+    }
+
+    /// Returns a page of a pet's weight history in chronological order,
+    /// starting at the zero-based `offset`. `limit` is capped at
+    /// `MAX_WEIGHT_HISTORY_PAGE_SIZE`; a `limit` of 0 returns an empty page.
+    /// Only the requested slice is read from storage. (Issue #301)
+    pub fn get_weight_history_paged(
+        env: Env,
+        pet_id: u64,
+        offset: u64,
+        limit: u32,
+    ) -> Vec<WeightEntry> {
+        let mut page = Vec::new(&env);
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, Pet>(&DataKey::Pet(pet_id))
+            .is_none()
+        {
+            return page;
+        }
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&NutritionKey::PetWeightCount(pet_id))
+            .unwrap_or(0);
+        let effective_limit = limit.min(MAX_WEIGHT_HISTORY_PAGE_SIZE) as u64;
+        if offset >= count || effective_limit == 0 {
+            return page;
+        }
+
+        // Storage indices are 1-based.
+        let start = offset.saturating_add(1);
+        let end = offset.saturating_add(effective_limit).min(count);
+        for i in start..=end {
+            if let Some(wid) = env
+                .storage()
+                .instance()
+                .get::<NutritionKey, u64>(&NutritionKey::PetWeightByIndex((pet_id, i)))
+            {
+                if let Some(entry) = env
+                    .storage()
+                    .instance()
+                    .get(&NutritionKey::WeightEntry(wid))
+                {
+                    page.push_back(entry);
+                }
+            }
         }
         page
     }
