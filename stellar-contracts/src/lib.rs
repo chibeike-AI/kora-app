@@ -1383,6 +1383,8 @@ pub enum MedicalKey {
     PetMedicalRecordCount(u64),
     MedicalRecordAmendment((u64, u32)),
     MedicalRecordAmendmentCount(u64),
+    // Issue #272: track per-record encryption key version for monotonic rotation
+    RecordEncryptionKeyVersion(u64),
     KeywordRecordCount((u64, Bytes)),
     KeywordRecordIndex((u64, Bytes, u64)),
     GlobalMedication(u64),          // medication_id -> Medication
@@ -10566,8 +10568,23 @@ impl KoraContract {
             panic_with_error!(&env, ContractError::Unauthorized);
         }
 
+        // Issue #272: enforce strictly monotonic key version increments to
+        // prevent replay attacks with revoked keys.
+        let current_key_version: u32 = env
+            .storage()
+            .instance()
+            .get(&MedicalKey::RecordEncryptionKeyVersion(record_id))
+            .unwrap_or(0);
+        if new_key_version <= current_key_version {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
         record.updated_at = env.ledger().timestamp();
-        let _ = new_key_version;
+
+        // Persist the new key version so future rotations can validate against it.
+        env.storage()
+            .instance()
+            .set(&MedicalKey::RecordEncryptionKeyVersion(record_id), &new_key_version);
 
         env.storage()
             .instance()
@@ -10629,8 +10646,10 @@ impl KoraContract {
         }
 
         // Validate the IPFS hash format up-front.
+        // Issue #271: CIDv0 hashes are at least 46 characters; reject anything
+        // shorter (empty or truncated strings) as well as anything over 128.
         let len = ipfs_hash.len() as usize;
-        if len > 128 {
+        if len < 46 || len > 128 {
             panic_with_error!(&env, ContractError::InvalidInput);
         }
         let mut bytes = [0u8; 128];
@@ -14808,6 +14827,9 @@ impl KoraContract {
         caller: Address,
     ) -> Vec<MedicalRecord> {
         Self::bump_instance_ttl(&env);
+        // Issue #273: cap the per-call limit to 50 to prevent unbounded memory
+        // and CPU usage on large record sets.
+        let limit = limit.min(50);
         let count: u64 = env
             .storage()
             .instance()
@@ -15317,6 +15339,12 @@ impl KoraContract {
     pub fn diff_record_versions(env: Env, pet_id: u64, record_id: u64, from_version: u32, to_version: u32) -> Vec<MedicalFieldDiff> {
         let record: MedicalRecord = Self::load_medical_record(&env, record_id).unwrap_or_else(|| panic_with_error!(&env, ContractError::RecordNotFound));
         if record.pet_id != pet_id {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+        // Issue #270: from_version must be strictly less than to_version.
+        // Diffing equal or inverted ranges produces meaningless results and
+        // wastes compute budget.
+        if from_version >= to_version {
             panic_with_error!(&env, ContractError::InvalidInput);
         }
         let max_version: u32 = env.storage().instance().get::<MedicalKey, u32>(&MedicalKey::MedicalRecordAmendmentCount(record_id)).unwrap_or(0);

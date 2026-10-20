@@ -1,81 +1,53 @@
-# Build artifacts
+# ── Build artifacts ──────────────────────────────────────────────────────────
 target/
 stellar-contracts/target/
 
-# Dependency lockfiles (generated, not committed at root level)
-# Cargo lock files (workspace-level kept, sub-crate excluded)
+# ── Dependency lockfiles ──────────────────────────────────────────────────────
+# Workspace-level Cargo.lock is committed; sub-crate lock is not.
 stellar-contracts/Cargo.lock
-test_snapshots/
-ISSUES.md
-node_modules
-.env
-somzilla.md
-*.snap
-*.json.snap
 
-# Test snapshots (proptest / insta)
+# ── Test snapshots (proptest / insta / snapshot-testing crates) ───────────────
 test_snapshots/
-**/*.snap
-**/*.snap.new
+**/test_snapshots/
+**/.test_snapshots/
+**/__snapshots__/
+proptest-regressions/
+**/.proptest-regressions/
 *.snap
 *.snap.new
 
-# Celo / Node
+# ── Compiled Wasm artifacts (reproducibly built in CI) ───────────────────────
+*.wasm
+*.optimized.wasm
+
+# ── Celo / Node.js ───────────────────────────────────────────────────────────
 node_modules/
 celo-contracts/artifacts/
 celo-contracts/cache/
 celo-contracts/typechain-types/
 
-# Secrets & environment
+# ── JSON build artifacts (keep source JSON like package.json) ─────────────────
+*.min.json
+*.json.snap
+
+# ── Secrets & environment ─────────────────────────────────────────────────────
 .env
 .env.*
 
-# Foundry cache
+# ── Foundry / Starknet cache ──────────────────────────────────────────────────
 .snfoundry_cache/
 
-# Editor / OS artifacts
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-.idea/
-.vscode/
-
-# Misc project-specific
-ISSUES.md
-somzilla.md
-**/test_snapshots/
-**/*.snap
-**/*.snap.new
-
-# Proptest regression state directories
-proptest-regressions/
-**/.proptest-regressions/
-
-# Environment / secrets
-.env
-.env.*
-
-# Editor and IDE files
+# ── Editor & IDE files ────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS metadata
+# ── OS metadata ───────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Node.js
-node_modules/
-
-# Foundry / Starknet cache
-.snfoundry_cache/
-
-# Misc generated docs / drafts
+# ── Misc generated docs / drafts ─────────────────────────────────────────────
 ISSUES.md
 somzilla.md
-
-# JSON build artifacts (keep source JSON like package.json)
-*.min.json
