@@ -1030,3 +1030,89 @@ fn test_get_breeding_count_unrelated_pet_unaffected() {
     assert_eq!(client.get_breeding_count(&unrelated_id), 0);
 }
 }
+fn setup_behavior_validation() -> (Env, KoraContractClient<'static>, Address, u64) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(KoraContract, ());
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    client.init_admin(&admin);
+
+    let pet_id = client.register_pet(
+        &owner,
+        &String::from_str(&env, "Buddy"),
+        &String::from_str(&env, "2020-01-01"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Golden Retriever"),
+        &String::from_str(&env, "Golden"),
+        &30u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    (env, client, owner, pet_id)
+}
+
+#[test]
+#[should_panic(expected = "InvalidInput")]
+fn test_add_behavior_record_rejects_severity_zero() {
+    let (env, client, owner, pet_id) = setup_behavior_validation();
+    client.add_behavior_record(
+        &pet_id,
+        &owner,
+        &BehaviorType::Aggression,
+        &0u32,
+        &String::from_str(&env, "Severity zero"),
+    );
+}
+
+#[test]
+#[should_panic(expected = "InvalidInput")]
+fn test_add_behavior_record_rejects_severity_ten() {
+    let (env, client, owner, pet_id) = setup_behavior_validation();
+    client.add_behavior_record(
+        &pet_id,
+        &owner,
+        &BehaviorType::Aggression,
+        &10u32,
+        &String::from_str(&env, "Severity ten"),
+    );
+}
+
+#[test]
+#[should_panic(expected = "InvalidInput")]
+fn test_add_behavior_record_rejects_oversized_description() {
+    let (env, client, owner, pet_id) = setup_behavior_validation();
+    let long = [b'a'; 501];
+    client.add_behavior_record(
+        &pet_id,
+        &owner,
+        &BehaviorType::Training,
+        &3u32,
+        &String::from_bytes(&env, &long),
+    );
+}
+
+#[test]
+fn test_add_behavior_record_accepts_max_description_and_emits_event() {
+    use soroban_sdk::testutils::Events;
+
+    let (env, client, owner, pet_id) = setup_behavior_validation();
+    let max = [b'a'; 500];
+    let record_id = client.add_behavior_record(
+        &pet_id,
+        &owner,
+        &BehaviorType::Training,
+        &5u32,
+        &String::from_bytes(&env, &max),
+    );
+
+    let record = client.get_behavior_record(&record_id).unwrap();
+    assert_eq!(record.severity, 5);
+    assert_eq!(record.description.len(), 500);
+    assert!(!env.events().all().events().is_empty());
+}

@@ -1428,3 +1428,79 @@ fn test_add_weight_entry_emits_weight_recorded_event() {
     }
     assert!(found, "WeightRecorded event was not emitted");
 }
+
+#[test]
+#[should_panic(expected = "InvalidInput")]
+fn test_log_feeding_rejects_nonexistent_plan() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(KoraContract, ());
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let pet_id = client.register_pet(
+        &owner,
+        &String::from_str(&env, "Charlie"),
+        &String::from_str(&env, "2020-05-15"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Poodle"),
+        &String::from_str(&env, "White"),
+        &10u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    let now = env.ledger().timestamp();
+    client.log_feeding(&pet_id, &99u64, &1u32, &now);
+}
+
+#[test]
+fn test_get_weight_history_paged() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.cost_estimate().budget().reset_unlimited();
+
+    let contract_id = env.register(KoraContract, ());
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let pet_id = client.register_pet(
+        &owner,
+        &String::from_str(&env, "Rex"),
+        &String::from_str(&env, "2019-01-01"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Labrador"),
+        &String::from_str(&env, "Black"),
+        &30u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    for w in 1..=60u32 {
+        client.add_weight_entry(&pet_id, &(w * 1_000));
+    }
+
+    let first = client.get_weight_history_paged(&pet_id, &0u64, &10u32);
+    assert_eq!(first.len(), 10);
+    assert_eq!(first.get(0).unwrap().weight, 1_000);
+    assert_eq!(first.get(9).unwrap().weight, 10_000);
+
+    let second = client.get_weight_history_paged(&pet_id, &10u64, &10u32);
+    assert_eq!(second.len(), 10);
+    assert_eq!(second.get(0).unwrap().weight, 11_000);
+
+    // Limit is capped at 50.
+    let capped = client.get_weight_history_paged(&pet_id, &0u64, &100u32);
+    assert_eq!(capped.len(), 50);
+
+    let tail = client.get_weight_history_paged(&pet_id, &55u64, &50u32);
+    assert_eq!(tail.len(), 5);
+    assert_eq!(tail.get(4).unwrap().weight, 60_000);
+
+    assert_eq!(client.get_weight_history_paged(&pet_id, &60u64, &10u32).len(), 0);
+    assert_eq!(client.get_weight_history_paged(&pet_id, &0u64, &0u32).len(), 0);
+    assert_eq!(client.get_weight_history_paged(&999u64, &0u64, &10u32).len(), 0);
+}

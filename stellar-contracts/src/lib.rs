@@ -378,6 +378,14 @@ const MAX_ADVANCE_BOOKING_SECS: u64 = 90 * 86_400;
 /// calculators and weight-history graphs downstream. (Issue #71)
 const MAX_PET_WEIGHT_GRAMS: u32 = 500_000;
 
+/// Maximum length of a behavior record description, in bytes. Bounds
+/// instance storage growth per record. (Issue #302)
+const MAX_BEHAVIOR_DESCRIPTION_LEN: u32 = 500;
+
+/// Maximum number of weight entries returned per `get_weight_history_paged`
+/// call. (Issue #301)
+const MAX_WEIGHT_HISTORY_PAGE_SIZE: u32 = 50;
+
 /// Maximum allowed drift, in seconds, between a caller-supplied feeding
 /// timestamp and the current ledger time. A small allowance (5 minutes)
 /// accommodates minor clock skew between a client and the ledger, while
@@ -924,6 +932,17 @@ pub struct WeightRecordedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BehaviorRecordedEvent {
+    pub record_id: u64,
+    pub pet_id: u64,
+    pub behavior_type: BehaviorType,
+    pub severity: u32,
+    pub recorded_by: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PetData {
     pub name: String,
     pub species: String,
@@ -1389,6 +1408,8 @@ pub enum MedicalKey {
     PetMedicalRecordCount(u64),
     MedicalRecordAmendment((u64, u32)),
     MedicalRecordAmendmentCount(u64),
+    // Issue #272: track per-record encryption key version for monotonic rotation
+    RecordEncryptionKeyVersion(u64),
     KeywordRecordCount((u64, Bytes)),
     KeywordRecordIndex((u64, Bytes, u64)),
     GlobalMedication(u64),          // medication_id -> Medication
@@ -5464,7 +5485,8 @@ impl KoraContract {
 
     // --- BEHAVIOR RECORDS (Issue #798) ---
 
-    /// Add a behavior record for a pet. Severity must be between 0 and 10.
+    /// Add a behavior record for a pet. Severity must be between 1 and 5 and
+    /// the description at most `MAX_BEHAVIOR_DESCRIPTION_LEN` bytes.
     pub fn add_behavior_record(
         env: Env,
         pet_id: u64,
@@ -5477,6 +5499,11 @@ impl KoraContract {
 
         // Issue #70: severity is a 1-5 scale, not an arbitrary integer.
         if !(1..=5).contains(&severity) {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        // Issue #302: cap description length to prevent storage bloat.
+        if description.len() > MAX_BEHAVIOR_DESCRIPTION_LEN {
             panic_with_error!(&env, ContractError::InvalidInput);
         }
 
@@ -5496,14 +5523,15 @@ impl KoraContract {
             .unwrap_or(0u64)
             .saturating_add(1);
 
+        let now = env.ledger().timestamp();
         let record = BehaviorRecord {
             id: record_id,
             pet_id,
-            behavior_type,
+            behavior_type: behavior_type.clone(),
             severity,
             description,
-            recorded_by: caller,
-            recorded_at: env.ledger().timestamp(),
+            recorded_by: caller.clone(),
+            recorded_at: now,
         };
 
         env.storage()
@@ -5519,6 +5547,18 @@ impl KoraContract {
         env.storage()
             .instance()
             .set(&BehaviorKey::BehaviorRecordCount, &record_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "BehaviorRecorded"), pet_id),
+            BehaviorRecordedEvent {
+                record_id,
+                pet_id,
+                behavior_type,
+                severity,
+                recorded_by: caller,
+                timestamp: now,
+            },
+        );
 
         record_id
     }
@@ -9471,6 +9511,57 @@ impl KoraContract {
         page
     }
 
+    /// Returns a page of a pet's weight history in chronological order,
+    /// starting at the zero-based `offset`. `limit` is capped at
+    /// `MAX_WEIGHT_HISTORY_PAGE_SIZE`; a `limit` of 0 returns an empty page.
+    /// Only the requested slice is read from storage. (Issue #301)
+    pub fn get_weight_history_paged(
+        env: Env,
+        pet_id: u64,
+        offset: u64,
+        limit: u32,
+    ) -> Vec<WeightEntry> {
+        let mut page = Vec::new(&env);
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, Pet>(&DataKey::Pet(pet_id))
+            .is_none()
+        {
+            return page;
+        }
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&NutritionKey::PetWeightCount(pet_id))
+            .unwrap_or(0);
+        let effective_limit = limit.min(MAX_WEIGHT_HISTORY_PAGE_SIZE) as u64;
+        if offset >= count || effective_limit == 0 {
+            return page;
+        }
+
+        // Storage indices are 1-based.
+        let start = offset.saturating_add(1);
+        let end = offset.saturating_add(effective_limit).min(count);
+        for i in start..=end {
+            if let Some(wid) = env
+                .storage()
+                .instance()
+                .get::<NutritionKey, u64>(&NutritionKey::PetWeightByIndex((pet_id, i)))
+            {
+                if let Some(entry) = env
+                    .storage()
+                    .instance()
+                    .get(&NutritionKey::WeightEntry(wid))
+                {
+                    page.push_back(entry);
+                }
+            }
+        }
+        page
+    }
+
     pub fn get_weight_entry(env: Env, weight_id: u64) -> Option<WeightEntry> {
         env.storage()
             .instance()
@@ -10572,8 +10663,23 @@ impl KoraContract {
             panic_with_error!(&env, ContractError::Unauthorized);
         }
 
+        // Issue #272: enforce strictly monotonic key version increments to
+        // prevent replay attacks with revoked keys.
+        let current_key_version: u32 = env
+            .storage()
+            .instance()
+            .get(&MedicalKey::RecordEncryptionKeyVersion(record_id))
+            .unwrap_or(0);
+        if new_key_version <= current_key_version {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
         record.updated_at = env.ledger().timestamp();
-        let _ = new_key_version;
+
+        // Persist the new key version so future rotations can validate against it.
+        env.storage()
+            .instance()
+            .set(&MedicalKey::RecordEncryptionKeyVersion(record_id), &new_key_version);
 
         env.storage()
             .instance()
@@ -10635,8 +10741,10 @@ impl KoraContract {
         }
 
         // Validate the IPFS hash format up-front.
+        // Issue #271: CIDv0 hashes are at least 46 characters; reject anything
+        // shorter (empty or truncated strings) as well as anything over 128.
         let len = ipfs_hash.len() as usize;
-        if len > 128 {
+        if len < 46 || len > 128 {
             panic_with_error!(&env, ContractError::InvalidInput);
         }
         let mut bytes = [0u8; 128];
@@ -14820,6 +14928,9 @@ impl KoraContract {
         caller: Address,
     ) -> Vec<MedicalRecord> {
         Self::bump_instance_ttl(&env);
+        // Issue #273: cap the per-call limit to 50 to prevent unbounded memory
+        // and CPU usage on large record sets.
+        let limit = limit.min(50);
         let count: u64 = env
             .storage()
             .instance()
@@ -15329,6 +15440,12 @@ impl KoraContract {
     pub fn diff_record_versions(env: Env, pet_id: u64, record_id: u64, from_version: u32, to_version: u32) -> Vec<MedicalFieldDiff> {
         let record: MedicalRecord = Self::load_medical_record(&env, record_id).unwrap_or_else(|| panic_with_error!(&env, ContractError::RecordNotFound));
         if record.pet_id != pet_id {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+        // Issue #270: from_version must be strictly less than to_version.
+        // Diffing equal or inverted ranges produces meaningless results and
+        // wastes compute budget.
+        if from_version >= to_version {
             panic_with_error!(&env, ContractError::InvalidInput);
         }
         let max_version: u32 = env.storage().instance().get::<MedicalKey, u32>(&MedicalKey::MedicalRecordAmendmentCount(record_id)).unwrap_or(0);
